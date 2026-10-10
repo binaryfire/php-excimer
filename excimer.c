@@ -72,6 +72,12 @@ typedef struct {
 	/** The flush callback. If this is set, max_samples will also be set. */
 	zval z_callback;
 
+	/** The callback deciding whether to collect a sample. */
+	zval z_sample_filter;
+
+	/** Whether the sample filter is currently being called. */
+	int filtering;
+
 	/** The maximum number of samples in z_log before z_callback is called. */
 	zend_long max_samples;
 
@@ -166,9 +172,16 @@ static void ExcimerProfiler_flush(ExcimerProfiler_obj *profiler, zval *zp_old_lo
 static zend_object *ExcimerProfiler_new(zend_class_entry *ce);
 static void ExcimerProfiler_free_object(zend_object *object);
 static void ExcimerProfiler_dtor(zend_object *object);
+#if PHP_VERSION_ID < 80000
+static HashTable *ExcimerProfiler_get_gc(zval *object, zval **table, int *n);
+#else
+static HashTable *ExcimerProfiler_get_gc(zend_object *object, zval **table, int *n);
+#endif
 static PHP_METHOD(ExcimerProfiler, setPeriod);
 static PHP_METHOD(ExcimerProfiler, setEventType);
 static PHP_METHOD(ExcimerProfiler, setMaxDepth);
+static PHP_METHOD(ExcimerProfiler, setSampleFilter);
+static PHP_METHOD(ExcimerProfiler, clearSampleFilter);
 static PHP_METHOD(ExcimerProfiler, setFlushCallback);
 static PHP_METHOD(ExcimerProfiler, clearFlushCallback);
 static PHP_METHOD(ExcimerProfiler, start);
@@ -264,6 +277,13 @@ ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO(arginfo_ExcimerProfiler_setMaxDepth, 0)
 	ZEND_ARG_INFO(0, max_depth)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO(arginfo_ExcimerProfiler_setSampleFilter, 0)
+	ZEND_ARG_INFO(0, callback)
+ZEND_END_ARG_INFO()
+
+ZEND_BEGIN_ARG_INFO(arginfo_ExcimerProfiler_clearSampleFilter, 0)
 ZEND_END_ARG_INFO()
 
 ZEND_BEGIN_ARG_INFO(arginfo_ExcimerProfiler_setFlushCallback, 0)
@@ -393,6 +413,8 @@ static const zend_function_entry ExcimerProfiler_methods[] = {
 	PHP_ME(ExcimerProfiler, setPeriod, arginfo_ExcimerProfiler_setPeriod, 0)
 	PHP_ME(ExcimerProfiler, setEventType, arginfo_ExcimerProfiler_setEventType, 0)
 	PHP_ME(ExcimerProfiler, setMaxDepth, arginfo_ExcimerProfiler_setMaxDepth, 0)
+	PHP_ME(ExcimerProfiler, setSampleFilter, arginfo_ExcimerProfiler_setSampleFilter, 0)
+	PHP_ME(ExcimerProfiler, clearSampleFilter, arginfo_ExcimerProfiler_clearSampleFilter, 0)
 	PHP_ME(ExcimerProfiler, setFlushCallback, arginfo_ExcimerProfiler_setFlushCallback, 0)
 	PHP_ME(ExcimerProfiler, clearFlushCallback, arginfo_ExcimerProfiler_clearFlushCallback, 0)
 	PHP_ME(ExcimerProfiler, start, arginfo_ExcimerProfiler_start, 0)
@@ -516,6 +538,7 @@ static PHP_MINIT_FUNCTION(excimer)
 
 	REGISTER_EXCIMER_CLASS(ExcimerProfiler);
 	ExcimerProfiler_handlers.dtor_obj = ExcimerProfiler_dtor;
+	ExcimerProfiler_handlers.get_gc = ExcimerProfiler_get_gc;
 
 	REGISTER_EXCIMER_CLASS(ExcimerLog);
 	ExcimerLog_ce->get_iterator = ExcimerLog_get_iterator;
@@ -599,6 +622,7 @@ static zend_object *ExcimerProfiler_new(zend_class_entry *ce) /* {{{ */
 	log_obj->log.epoch = timerlib_timespec_to_ns(&now_ts);
 
 	ZVAL_NULL(&profiler->z_callback);
+	ZVAL_NULL(&profiler->z_sample_filter);
 	profiler->event_type = EXCIMER_REAL;
 	profiler->need_reinit = 1;
 
@@ -623,9 +647,31 @@ static void ExcimerProfiler_free_object(zend_object *object) /* {{{ */
 	ZVAL_UNDEF(&profiler->z_log);
 	zval_ptr_dtor(&profiler->z_callback);
 	ZVAL_UNDEF(&profiler->z_callback);
+	zval_ptr_dtor(&profiler->z_sample_filter);
+	ZVAL_UNDEF(&profiler->z_sample_filter);
 	zend_object_std_dtor(object);
 }
 /* }}} */
+
+#if PHP_VERSION_ID < 80000
+static HashTable *ExcimerProfiler_get_gc(zval *object, zval **table, int *n) /* {{{ */
+{
+	ExcimerProfiler_obj *profiler = EXCIMER_OBJ_ZP(ExcimerProfiler, object);
+	*table = &profiler->z_sample_filter;
+	*n = 1;
+	return zend_std_get_properties(object);
+}
+/* }}} */
+#else
+static HashTable *ExcimerProfiler_get_gc(zend_object *object, zval **table, int *n) /* {{{ */
+{
+	ExcimerProfiler_obj *profiler = EXCIMER_OBJ(ExcimerProfiler, object);
+	*table = &profiler->z_sample_filter;
+	*n = 1;
+	return zend_std_get_properties(object);
+}
+/* }}} */
+#endif
 
 static void ExcimerProfiler_dtor(zend_object *object) /* {{{ */
 {
@@ -696,6 +742,47 @@ static PHP_METHOD(ExcimerProfiler, setMaxDepth)
 	ExcimerProfiler_obj *profiler = EXCIMER_OBJ_ZP(ExcimerProfiler, getThis());
 	ExcimerLog_obj *log_obj = EXCIMER_OBJ_ZP(ExcimerLog, &profiler->z_log);
 	excimer_log_set_max_depth(&log_obj->log, max_depth);
+}
+/* }}} */
+
+/* {{{ proto void ExcimerProfiler::setSampleFilter(callable callback)
+ */
+static PHP_METHOD(ExcimerProfiler, setSampleFilter)
+{
+	zval *z_callback, old_callback;
+	ExcimerProfiler_obj *profiler = EXCIMER_OBJ_ZP(ExcimerProfiler, getThis());
+	char *is_callable_error;
+
+	ZEND_PARSE_PARAMETERS_START(1, 1)
+		Z_PARAM_ZVAL(z_callback)
+	ZEND_PARSE_PARAMETERS_END();
+
+	if (!zend_is_callable_ex(z_callback, NULL, 0, NULL, NULL, &is_callable_error)) {
+		php_error_docref(NULL, E_WARNING, "sample filter is not callable: %s",
+				is_callable_error);
+		efree(is_callable_error);
+		return;
+	}
+
+	ZVAL_COPY_VALUE(&old_callback, &profiler->z_sample_filter);
+	ZVAL_COPY(&profiler->z_sample_filter, z_callback);
+	zval_ptr_dtor(&old_callback);
+}
+/* }}} */
+
+/* {{{ proto void ExcimerProfiler::clearSampleFilter()
+ */
+static PHP_METHOD(ExcimerProfiler, clearSampleFilter)
+{
+	zval old_callback;
+	ExcimerProfiler_obj *profiler = EXCIMER_OBJ_ZP(ExcimerProfiler, getThis());
+
+	ZEND_PARSE_PARAMETERS_START(0, 0);
+	ZEND_PARSE_PARAMETERS_END();
+
+	ZVAL_COPY_VALUE(&old_callback, &profiler->z_sample_filter);
+	ZVAL_NULL(&profiler->z_sample_filter);
+	zval_ptr_dtor(&old_callback);
 }
 /* }}} */
 
@@ -824,20 +911,61 @@ static void ExcimerProfiler_event(zend_long event_count, void *user_data) /* {{{
 	uint64_t now_ns;
 	struct timespec now_ts;
 	ExcimerProfiler_obj *profiler = (ExcimerProfiler_obj*)user_data;
-	ExcimerLog_obj *log_obj = EXCIMER_OBJ_ZP(ExcimerLog, &profiler->z_log);
 	excimer_log *log;
+	int filtered = !Z_ISNULL(profiler->z_sample_filter);
+	zval z_profiler;
 
-	log = &log_obj->log;
+	if (profiler->filtering) {
+		return;
+	}
 
 	timerlib_clock_get_time(TIMERLIB_REAL, &now_ts);
 	now_ns = timerlib_timespec_to_ns(&now_ts);
 
+	if (filtered) {
+		zend_fcall_info fci;
+		zend_fcall_info_cache fcc;
+		zval callback, retval;
+		char *is_callable_error = NULL;
+		int accept = 0;
+
+		ZVAL_OBJ(&z_profiler, &profiler->std);
+		Z_ADDREF(z_profiler);
+		profiler->filtering = 1;
+		ZVAL_COPY(&callback, &profiler->z_sample_filter);
+		ZVAL_UNDEF(&retval);
+		if (zend_fcall_info_init(&callback, 0, &fci, &fcc, NULL,
+			&is_callable_error) == SUCCESS)
+		{
+			fci.retval = &retval;
+			if (zend_call_function(&fci, &fcc) == SUCCESS && !EG(exception)) {
+				accept = zend_is_true(&retval);
+			}
+			zval_ptr_dtor(&retval);
+		} else {
+			php_error(E_WARNING, "ExcimerProfiler sample filter is not callable (during event): %s",
+				is_callable_error);
+			efree(is_callable_error);
+			ExcimerProfiler_stop(profiler);
+		}
+		zval_ptr_dtor(&callback);
+		profiler->filtering = 0;
+		if (!accept || !profiler->timer.is_running) {
+			zval_ptr_dtor(&z_profiler);
+			return;
+		}
+	}
+
+	log = &EXCIMER_OBJ_ZP(ExcimerLog, &profiler->z_log)->log;
 	excimer_log_add(log, EG(current_execute_data), event_count, now_ns);
 
 	if (profiler->max_samples && log->entries_size >= profiler->max_samples) {
 		zval z_old_log;
 		ExcimerProfiler_flush(profiler, &z_old_log);
 		zval_ptr_dtor(&z_old_log);
+	}
+	if (filtered) {
+		zval_ptr_dtor(&z_profiler);
 	}
 }
 /* }}} */

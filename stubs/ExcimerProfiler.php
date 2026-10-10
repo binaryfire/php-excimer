@@ -46,6 +46,32 @@ class ExcimerProfiler {
 	}
 
 	/**
+	 * Set a callback which decides whether to collect a sample.
+	 *
+	 * The callback is called without arguments before collecting each stack
+	 * trace. Return true to collect the sample, or false to discard it.
+	 * Discarded samples do not contribute to the log's event count or trigger
+	 * the flush callback.
+	 *
+	 * This can be used to profile a specific Fiber or other execution context
+	 * without collecting samples from unrelated work in the same process.
+	 *
+	 * Keep the callback short. Samples triggered while it runs are ignored.
+	 *
+	 * This will take effect immediately.
+	 *
+	 * @param callable $callback
+	 */
+	public function setSampleFilter( $callback ) {
+	}
+
+	/**
+	 * Clear the sample filter. All samples will be collected.
+	 */
+	public function clearSampleFilter() {
+	}
+
+	/**
 	 * Set a callback which will be called once the specified number of samples
 	 * has been collected.
 	 *
